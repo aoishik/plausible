@@ -1,0 +1,8 @@
+FROM ghcr.io/plausible/community-edition:v3.2.1
+
+ENV TMPDIR=/var/lib/plausible/tmp
+
+EXPOSE 8000
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["run"]

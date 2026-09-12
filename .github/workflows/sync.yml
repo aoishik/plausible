@@ -1,0 +1,334 @@
+name: Sync Plausible v3
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: plausible-sync
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Preserve workflow
+        run: |
+          mkdir -p /tmp/plausible-sync
+          cp .github/workflows/sync.yml /tmp/plausible-sync/sync.yml
+
+      - name: Find newest v3 branch
+        id: version
+        run: |
+          set -euo pipefail
+
+          BRANCH="$(
+            git ls-remote --heads \
+              https://github.com/plausible/community-edition.git |
+            awk '{print $2}' |
+            sed 's#refs/heads/##' |
+            grep -E '^v3\.[0-9]+\.[0-9]+$' |
+            sort -V |
+            tail -n 1
+          )"
+
+          if [ -z "$BRANCH" ]; then
+            echo "ERROR: Could not find a v3.x.x branch."
+            exit 1
+          fi
+
+          echo "Newest v3 branch: $BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch newest v3 branch
+        env:
+          BRANCH: ${{ steps.version.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          git remote add upstream \
+            https://github.com/plausible/community-edition.git
+
+          git fetch \
+            upstream \
+            "refs/heads/${BRANCH}:refs/remotes/upstream/${BRANCH}"
+
+      - name: Force sync with upstream
+        env:
+          BRANCH: ${{ steps.version.outputs.branch }}
+        run: |
+          git checkout main
+
+          # Intentionally discard fork-only commits.
+          # No merge = no merge conflicts.
+          git reset --hard "upstream/${BRANCH}"
+
+      - name: Restore workflow
+        run: |
+          mkdir -p .github/workflows
+          cp /tmp/plausible-sync/sync.yml .github/workflows/sync.yml
+
+      # ----------------------------------------------------------
+      # Remove PostgreSQL from the upstream Compose file.
+      # PostgreSQL is hosted separately.
+      # ----------------------------------------------------------
+
+      - name: Remove bundled PostgreSQL
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("compose.yml")
+
+          if not path.exists():
+              raise SystemExit("ERROR: compose.yml not found")
+
+          text = path.read_text()
+
+          # Remove complete plausible_db service.
+          text, count = re.subn(
+              r"(?ms)^  plausible_db:\n.*?(?=^  [A-Za-z0-9_-]+:|\Z)",
+              "",
+              text,
+          )
+
+          if count != 1:
+              raise SystemExit(
+                  f"Expected 1 plausible_db service, found {count}"
+              )
+
+          # Remove plausible_db dependency.
+          text, count = re.subn(
+              r"(?m)^      plausible_db:\n"
+              r"        condition: service_healthy\n",
+              "",
+              text,
+          )
+
+          if count != 1:
+              raise SystemExit(
+                  f"Expected 1 plausible_db dependency, found {count}"
+              )
+
+          # Remove PostgreSQL volume.
+          text, count = re.subn(
+              r"(?m)^  db-data:\n",
+              "",
+              text,
+          )
+
+          if count != 1:
+              raise SystemExit(
+                  f"Expected 1 db-data volume, found {count}"
+              )
+
+          path.write_text(text)
+
+          print("Bundled PostgreSQL removed.")
+          PY
+
+      # ----------------------------------------------------------
+      # Create Plausible Dockerfile
+      # ----------------------------------------------------------
+
+      - name: Create Plausible Dockerfile
+        env:
+          BRANCH: ${{ steps.version.outputs.branch }}
+        run: |
+          cat > Dockerfile.plausible <<EOF
+          FROM ghcr.io/plausible/community-edition:${BRANCH}
+
+          ENV TMPDIR=/var/lib/plausible/tmp
+
+          EXPOSE 8000
+
+          ENTRYPOINT ["/entrypoint.sh"]
+          CMD ["run"]
+          EOF
+
+      # ----------------------------------------------------------
+      # Create ClickHouse Dockerfile
+      # ----------------------------------------------------------
+
+      - name: Create ClickHouse Dockerfile
+        run: |
+          cat > Dockerfile.clickhouse <<'EOF'
+          FROM clickhouse/clickhouse-server:24.12-alpine
+
+          COPY clickhouse/logs.xml \
+              /etc/clickhouse-server/config.d/logs.xml
+
+          COPY clickhouse/ipv4-only.xml \
+              /etc/clickhouse-server/config.d/ipv4-only.xml
+
+          COPY clickhouse/low-resources.xml \
+              /etc/clickhouse-server/config.d/low-resources.xml
+
+          COPY clickhouse/default-profile-low-resources-overrides.xml \
+              /etc/clickhouse-server/users.d/default-profile-low-resources-overrides.xml
+
+          EXPOSE 8123
+          EXPOSE 9000
+          EOF
+
+      # ----------------------------------------------------------
+      # Make sure ClickHouse configuration directory exists.
+      # ----------------------------------------------------------
+
+      - name: Create ClickHouse configuration
+        run: |
+          mkdir -p clickhouse
+
+          cat > clickhouse/ipv4-only.xml <<'EOF'
+          <clickhouse>
+              <listen_host>0.0.0.0</listen_host>
+          </clickhouse>
+          EOF
+
+          cat > clickhouse/low-resources.xml <<'EOF'
+          <clickhouse>
+              <mark_cache_size>524288000</mark_cache_size>
+          </clickhouse>
+          EOF
+
+          cat > clickhouse/default-profile-low-resources-overrides.xml <<'EOF'
+          <clickhouse>
+              <profiles>
+                  <default>
+                      <max_threads>1</max_threads>
+                      <max_block_size>8192</max_block_size>
+                      <max_download_threads>1</max_download_threads>
+                      <input_format_parallel_parsing>0</input_format_parallel_parsing>
+                      <output_format_parallel_formatting>0</output_format_parallel_formatting>
+                  </default>
+              </profiles>
+          </clickhouse>
+          EOF
+
+          cat > clickhouse/logs.xml <<'EOF'
+          <clickhouse>
+              <logger>
+                  <level>warning</level>
+                  <console>true</console>
+              </logger>
+
+              <query_log replace="1">
+                  <database>system</database>
+                  <table>query_log</table>
+                  <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+
+                  <engine>
+                      ENGINE = MergeTree
+                      PARTITION BY event_date
+                      ORDER BY (event_time)
+                      TTL event_date + interval 30 day
+                      SETTINGS ttl_only_drop_parts=1
+                  </engine>
+              </query_log>
+
+              <metric_log remove="remove" />
+              <asynchronous_metric_log remove="remove" />
+              <query_thread_log remove="remove" />
+              <text_log remove="remove" />
+              <trace_log remove="remove" />
+              <session_log remove="remove" />
+              <part_log remove="remove" />
+          </clickhouse>
+          EOF
+
+          echo "ClickHouse configuration created."
+
+      # ----------------------------------------------------------
+      # Environment example
+      # ----------------------------------------------------------
+
+      - name: Create environment example
+        run: |
+          cat > .env.example <<'EOF'
+          # Plausible
+          BASE_URL=https://analytics.example.com
+          SECRET_KEY_BASE=CHANGE_ME
+
+          # External PostgreSQL
+          DATABASE_URL=postgres://USER:PASSWORD@POSTGRES_HOST:5432/DATABASE
+
+          # Separate ClickHouse deployment
+          CLICKHOUSE_DATABASE_URL=http://CLICKHOUSE_HOST:8123/plausible_events_db
+          EOF
+
+      # ----------------------------------------------------------
+      # Verify Plausible database variables.
+      # ----------------------------------------------------------
+
+      - name: Verify database configuration
+        run: |
+          if ! grep -q "DATABASE_URL" compose.yml; then
+            echo "ERROR: DATABASE_URL is missing."
+            exit 1
+          fi
+
+          if ! grep -q "CLICKHOUSE_DATABASE_URL" compose.yml; then
+            echo "ERROR: CLICKHOUSE_DATABASE_URL is missing."
+            exit 1
+          fi
+
+          echo "Database configuration verified."
+
+      # ----------------------------------------------------------
+      # Validate Compose
+      # ----------------------------------------------------------
+
+      - name: Validate Docker Compose
+        run: |
+          docker compose config >/dev/null
+          echo "Docker Compose configuration is valid."
+
+      # ----------------------------------------------------------
+      # Commit everything
+      # ----------------------------------------------------------
+
+      - name: Commit changes
+        env:
+          BRANCH: ${{ steps.version.outputs.branch }}
+        run: |
+          git add compose.yml
+
+          # These files are ignored by the upstream .gitignore,
+          # so explicitly force-add only the files we generate.
+          git add -f Dockerfile.plausible
+          git add -f Dockerfile.clickhouse
+          git add -f clickhouse/
+          git add -f .env.example
+          git add -f .github/workflows/sync.yml
+
+          if git diff --cached --quiet; then
+            echo "Already up to date."
+            exit 0
+          fi
+
+          git commit -m "Sync Plausible ${BRANCH}"
+
+      # ----------------------------------------------------------
+      # Force push
+      # ----------------------------------------------------------
+
+      - name: Force push
+        run: |
+          git push origin main --force
