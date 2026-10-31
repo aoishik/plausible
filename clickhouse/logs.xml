@@ -8,6 +8,7 @@
         <database>system</database>
         <table>query_log</table>
         <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+
         <engine>
             ENGINE = MergeTree
             PARTITION BY event_date
@@ -17,7 +18,6 @@
         </engine>
     </query_log>
 
-    <!-- Stops unnecessary logging -->
     <metric_log remove="remove" />
     <asynchronous_metric_log remove="remove" />
     <query_thread_log remove="remove" />
